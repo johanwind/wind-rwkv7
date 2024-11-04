@@ -1,3 +1,5 @@
+// Copyright (c) 2024, Johan Sokrates Wind
+
 #include <cuda_bf16.h>
 #include <stdio.h>
 
@@ -319,26 +321,30 @@ __device__ RTile from_warp(const RTile&ra, int src, float4*share) {
     return ret;
 }
 
-// transpose(inv(I-f)) where f is strictly lower triangular
-// Numerically unstable?
-__device__ FTile tri_minvT(const FTile&f) {
+// inv(I-f) where f is strictly lower triangular
+__device__ FTile tri_minv(const FTile&f, float*share) {
     int i0 = threadIdx.x%32/4, j0 = threadIdx.x%4*2;
-
-    auto getCol = [&](int col, float eye) {
-        FTile ret;
-        for (int k = 0; k < 8; k++) {
-            int i = i0+k/2%2*8, j = j0+k%2+k/4*8;
-            if (j == col && j < i)
-                ret.fdata[k] = f.fdata[k]; // -
-            else
-                ret.fdata[k] = float(i==j)*eye;
+    float inv[16] = {};
+    for (int k = 0; k < 8; k++) {
+        int i = i0+k/2%2*8, j = j0+k%2+k/4*8;
+        share[i*16+j] = f.fdata[k];
+    }
+    int tid = threadIdx.x%32;
+    inv[tid%16] = 1;
+    for (int i = 1; i < 16; i++) {
+        for (int j = 0; j < i; j++) {
+            float fac = share[i*16+j];
+            inv[i] += fac*inv[j];
         }
-        return ret;
-    };
-    FTile prod = getCol(-1, 1.f);
-    for (int i = 0; i < 15; i++)
-        prod += (RTile)prod % getCol(i, 0.f);
-    return prod;
+    }
+    for (int i = 0; i < 16; i++)
+        share[tid*16+i] = inv[i];
+    FTile ret;
+    for (int k = 0; k < 8; k++) {
+        int i = i0+k/2%2*8, j = j0+k%2+k/4*8;
+        ret.fdata[k] = share[j*16+i];
+    }
+    return ret;
 }
 
 template<int strict>
@@ -487,4 +493,25 @@ __device__ RTile fast_dw(const RTile&A, const RTile&q, const RTile&k) {
 
 __device__ void debug_set(RTile&ra, int i, int j, float v) {
     if (threadIdx.x%32 == i%8*4+j%8/2) ((bf*)ra.data)[i/8*2+j/8*4+j%2] = to_bf(v);
+}
+
+template<int WARPS>
+__device__ float2 sumh(const FTile&f, float2*share) {
+    float2 warpsum = {f.fdata[0]+f.fdata[1]+f.fdata[4]+f.fdata[5],
+        f.fdata[2]+f.fdata[3]+f.fdata[6]+f.fdata[7]};
+    warpsum.x += __shfl_xor_sync(0xffffffff, warpsum.x, 1);
+    warpsum.y += __shfl_xor_sync(0xffffffff, warpsum.y, 1);
+    warpsum.x += __shfl_xor_sync(0xffffffff, warpsum.x, 2);
+    warpsum.y += __shfl_xor_sync(0xffffffff, warpsum.y, 2);
+
+    int warpi = threadIdx.x/32, i = threadIdx.x%32/4, j = threadIdx.x%4;
+    float2 allsum = {0,0};
+    for (int wi = 0; wi < WARPS; wi++) {
+        if (warpi == wi && j == 0) share[i] = warpsum;
+        __syncthreads();
+        allsum.x += share[i].x;
+        allsum.y += share[i].y;
+        __syncthreads();
+    }
+    return allsum;
 }
