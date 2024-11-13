@@ -4,16 +4,10 @@ import torch as th
 import triton
 import triton.language as tl
 
-def reference(x, mix_x, Wmix1, Wmix2, mix_bias):
-    B,T,C = x.shape
-    dtype = x.dtype
-    x, mix_x, Wmix1, Wmix2, mix_bias = [i.float() for i in [x, mix_x, Wmix1, Wmix2, mix_bias]]
-    xx = th.nn.functional.pad(x, (0,0,1,-1)) - x
-    xxx = x + xx * mix_x
-    xxx = th.tanh(xxx @ Wmix1.mT).view(B*T, 4, -1).transpose(0, 1)
-    xxx = (xxx @ Wmix2.mT).view(4, B, T, C)
-    return (x + xx * (xxx+mix_bias)).to(dtype).unbind(dim=0)
 
+@triton.jit
+def IND2(a,b,nb):
+    return a*nb+b
 @triton.jit
 def IND3(a,b,c,nb,nc):
     return (a*nb+b)*nc+c
@@ -45,12 +39,11 @@ def fw1_triton_(x_, alpha_, L_, b_, T:tl.constexpr,C:tl.constexpr,D:tl.constexpr
 
 def fw1_triton(x, alpha, L):
     B,T,C = x.shape
-    D = 128
+    D = L.shape[0]
     dC = min(C,32)
     dT = min(T,64)
     assert T%dT == 0
     assert C%dC == 0
-    assert L.shape[0] == D
     b = th.empty((B,T,D), dtype=th.bfloat16, device=x.device)
     fw1_triton_[(B*(T//dT),)](x, alpha, L, b, T,C,D,dT,dC, num_stages=1)
     return b
@@ -79,8 +72,8 @@ def fw2_triton_(x_, beta_, R_, b_, y_, B:tl.constexpr,T:tl.constexpr,C:tl.conste
 
 def fw2_triton(b, R, beta, x):
     B,T,C = x.shape
-    D = 32
-    dC = min(C,32)
+    D = R.shape[2]
+    dC = min(C,64)
     dT = min(T,64)
     assert T%dT == 0
     assert C%dC == 0
@@ -92,7 +85,7 @@ def fw2_triton(b, R, beta, x):
 
 
 @triton.jit
-def bw1_triton_(dy0_,dy1_,dy2_,dy3_, x_, R_, db_,  B:tl.constexpr,T:tl.constexpr,C:tl.constexpr,D:tl.constexpr,dT:tl.constexpr,dC:tl.constexpr):
+def bw1_triton_(dy0_,dy1_,dy2_,dy3_, x_, R_, db_, b_,  B:tl.constexpr,T:tl.constexpr,C:tl.constexpr,D:tl.constexpr,dT:tl.constexpr,dC:tl.constexpr):
     bi = tl.program_id(0)//(T//dT)
     t0 = tl.program_id(0)%(T//dT) * dT
 
@@ -116,108 +109,188 @@ def bw1_triton_(dy0_,dy1_,dy2_,dy3_, x_, R_, db_,  B:tl.constexpr,T:tl.constexpr
 
         R = tl.load(R_+IND3(k,i0+iT,j, C,D), eviction_policy='evict_last')
         db = tl.dot(dc, R, db)
+    b = tl.load(b_+IND4(bi,t,k,j, T,4,D)).to(tl.float32)
+    db = db-b*b*db
     tl.store(db_+IND4(bi,t,k,j, T,4,D), db.to(tl.bfloat16))
 
-def bw1_triton(dy, x, R):
+def bw1_triton(dy, x, R, b):
     B,T,C = x.shape
-    D = 32
+    D = R.shape[2]
     dC = min(C, 128)
     dT = min(T, 32)
     assert T%dT == 0
     assert C%dC == 0
     assert list(R.shape) == [4,C,D]
     db = th.empty((B,T,4*D), dtype=th.bfloat16, device=x.device)
-    bw1_triton_[(B*(T//dT),)](*dy, x, R, db, B,T,C,D,dT,dC, num_stages=1)
+    bw1_triton_[(B*(T//dT),)](*dy, x, R, db, b, B,T,C,D,dT,dC, num_stages=1)
     return db
 
 
 @triton.jit
-def bw2_triton_(dy0_,dy1_,dy2_,dy3_, x_, b_, db_, L_, R_, alpha_, beta_, dx_, dL_, dR_, dalpha_, dbeta_, dx0_, B:tl.constexpr,T:tl.constexpr,C:tl.constexpr,D:tl.constexpr,dT:tl.constexpr,dC:tl.constexpr,dT2:tl.constexpr):
+def bw2_triton_(x_, A_, y_, m:tl.constexpr,n:tl.constexpr,k:tl.constexpr,dm:tl.constexpr,dn:tl.constexpr,dk:tl.constexpr):
+    i = dm*tl.program_id(1) + tl.arange(0,dm)
+    j = dn*tl.program_id(0) + tl.arange(0,dn)
+    acc = tl.zeros((dm,dn), tl.float32)
+    for k0 in range(0,k,dk):
+        l = k0+tl.arange(0,dk)
+        x = tl.load(x_+i[:,None]*k+l[None,:])
+        AT = tl.load(A_+j[:,None]+l[None,:]*n, eviction_policy='evict_last')
+        acc = tl.dot(x, AT.trans(), acc)
+    tl.store(y_+n*i[:,None]+j[None,:], acc.to(tl.bfloat16), eviction_policy='evict_first')
+
+def bw2_triton(x, A):
+    B,T,D = x.shape
+    x = x.view(B*T,D)
+    m,k = x.shape
+    n = A.shape[1]
+    dk = min(k,64)
+    dn = min(n,64)
+    dm = min(m,64)
+    assert m%dm == 0
+    assert n%dn == 0
+    assert k%dk == 0
+    y = th.empty((m,n), dtype=th.bfloat16, device=x.device)
+    bw2_triton_[(n//dn,m//dm)](x, A, y, m,n,k,dm,dn,dk, num_stages=2)
+    return y.view(B,T,-1)
+
+
+
+@triton.jit
+def inner(beta_,b_,R_,dy_, prod,dx,diff, dbeta_k,dR_k, bi,t,i,j,k:tl.constexpr, T:tl.constexpr,C:tl.constexpr,D:tl.constexpr):
+    beta = tl.load(beta_+k*C+i)
+    b = tl.load(b_+IND4(bi,t,k,j, T,4,D))
+    RT = tl.load(R_+IND3(k,i,j.trans(), C,D))
+    c = tl.dot(b, RT).to(tl.bfloat16) + beta
+
+    dy = tl.load(dy_+IND3(bi,t,i, T,C), eviction_policy='evict_first')
+    prod += dy*c
+    dx += dy
+
+    dc = dy * diff
+
+    dbeta_k += tl.sum(dc,axis=0,keep_dims=True)
+    dR_k = tl.dot(dc.trans(), b, dR_k)
+    return prod,dx,dbeta_k,dR_k 
+
+@triton.jit
+def bw3_triton_(dy0_,dy1_,dy2_,dy3_, x_, b_, da_, R_, alpha_, beta_, dx_, dR_, dalpha_, dbeta_, dx0_, B:tl.constexpr,T:tl.constexpr,C:tl.constexpr,D:tl.constexpr,dT:tl.constexpr,dC:tl.constexpr,dT2:tl.constexpr):
     bi = tl.program_id(0)//((T//dT2)*(C//dC))
     t0 = tl.program_id(0)//(C//dC)%(T//dT2) * dT2
     i0 = tl.program_id(0)%(C//dC) * dC
 
-    dt = tl.arange(0,dT)[None,:,None]
-    i = i0+tl.arange(0,dC)[None,None,:]
-    j = tl.arange(0,D)[None,None,:]
-    jT = tl.arange(0,D)[None,:,None]
-    k = tl.arange(0,4)[:,None,None]
+    dt = tl.arange(0,dT)[:,None]
+    i = i0+tl.arange(0,dC)[None,:]
+    j = tl.arange(0,D)[None,:]
 
-    dR = tl.zeros((4,dC,D), tl.float32)
-    dL = tl.zeros((4*D,dC), tl.float32)
-    dalpha = tl.zeros((1,1,dC), tl.float32)
-    dbeta = tl.zeros((4,1,dC), tl.float32)
+    dR0 = tl.zeros((dC,D), tl.float32)
+    dR1 = tl.zeros((dC,D), tl.float32)
+    dR2 = tl.zeros((dC,D), tl.float32)
+    dR3 = tl.zeros((dC,D), tl.float32)
+
+    dalpha = tl.zeros((1,dC), tl.float32)
+
+    dbeta0 = tl.zeros((1,dC), tl.float32)
+    dbeta1 = tl.zeros((1,dC), tl.float32)
+    dbeta2 = tl.zeros((1,dC), tl.float32)
+    dbeta3 = tl.zeros((1,dC), tl.float32)
 
     for t1 in range(t0,t0+dT2,dT):
         t = t1+dt
 
-        db = tl.load(db_+IND4(bi,t,k,j, T,4,D))
-        b = tl.load(b_+IND4(bi,t,k,j, T,4,D))
-        db = db - db*b*b
-        db = tl.trans(db,1,0,2).reshape(dT,4*D)
+        alpha = tl.load(alpha_+i)
+        da = tl.load(da_+IND3(bi,t,i, T,C))
 
         x = tl.load(x_+IND3(bi,t,i, T,C))
         diff = tl.load(x_+IND3(bi,t-1,i, T,C), mask=(t>0)) - x
-        alpha = tl.load(alpha_+i)
-        a = x + diff * alpha
-        dL = tl.dot(db.trans(), a.reshape(dT,dC), dL)
 
-        L = tl.load(L_+IND3(k,jT,i, D,C)).reshape(4*D,dC)
-        da = tl.dot(db, L).to(tl.bfloat16)
-        dalpha += tl.sum(da[None,:,:]*diff, axis=1, keep_dims=True)
+        dalpha += tl.sum(da*diff, axis=0, keep_dims=True)
 
-        beta = tl.load(beta_+k*C+i)
-        RT = tl.load(R_+IND3(k,i,jT, C,D))
-        c = tl.dot(b, RT).to(tl.bfloat16) + beta
+        prod = da*alpha
+        dx = da
 
-        dy = tl.zeros((4,dT,dC), tl.bfloat16)
-        dy += tl.load(dy0_+IND3(bi,t,i, T,C)+k*0, mask=k==0)
-        dy += tl.load(dy1_+IND3(bi,t,i, T,C)+k*0, mask=k==1)
-        dy += tl.load(dy2_+IND3(bi,t,i, T,C)+k*0, mask=k==2)
-        dy += tl.load(dy3_+IND3(bi,t,i, T,C)+k*0, mask=k==3)
-        dc = dy * diff
+        prod,dx,dbeta0,dR0 = inner(beta_,b_,R_,dy0_, prod,dx,diff, dbeta0,dR0, bi,t,i,j,0, T,C,D)
+        prod,dx,dbeta1,dR1 = inner(beta_,b_,R_,dy1_, prod,dx,diff, dbeta1,dR1, bi,t,i,j,1, T,C,D)
+        prod,dx,dbeta2,dR2 = inner(beta_,b_,R_,dy2_, prod,dx,diff, dbeta2,dR2, bi,t,i,j,2, T,C,D)
+        prod,dx,dbeta3,dR3 = inner(beta_,b_,R_,dy3_, prod,dx,diff, dbeta3,dR3, bi,t,i,j,3, T,C,D)
 
-        dbeta += tl.sum(dc,axis=1,keep_dims=True)
-        dR = tl.dot(tl.trans(dc,0,2,1), b, dR)
-
-        prod = tl.sum(dy*c, axis=0, keep_dims=True) + da*alpha
-        dx0 = tl.sum(prod*(dt==0), axis=1, keep_dims=True)
+        dx0 = tl.sum(prod*(dt==0), axis=0, keep_dims=True)
         tl.store(dx0_+IND3(bi,t1//dT,i, T//dT,C), dx0)
         tl.store(dx_+IND3(bi,t,i, T,C), prod)
         tl.debug_barrier()
         shifted = tl.load(dx_+IND3(bi,t+1,i, T,C), mask=dt+1<dT)
-
-        dx = tl.sum(dy, axis=0, keep_dims=True) + da - prod + shifted
+        dx += - prod + shifted
         tl.store(dx_+IND3(bi,t,i, T,C), dx)
 
-    tl.atomic_add(dL_+IND3(k,tl.trans(j,0,2,1),i, D,C), dL.reshape(4,D,dC))
-    tl.atomic_add(dR_+IND3(k,tl.trans(i,0,2,1),j, C,D), dR)
-    tl.atomic_add(dalpha_+i, dalpha)
-    tl.atomic_add(dbeta_+k*C+i, dbeta)
+    tl.atomic_add(dR_+IND3(0,i.trans(),j, C,D), dR0)
+    tl.atomic_add(dR_+IND3(1,i.trans(),j, C,D), dR1)
+    tl.atomic_add(dR_+IND3(2,i.trans(),j, C,D), dR2)
+    tl.atomic_add(dR_+IND3(3,i.trans(),j, C,D), dR3)
+    tl.atomic_add(dbeta_+0*C+i, dbeta0)
+    tl.atomic_add(dbeta_+1*C+i, dbeta1)
+    tl.atomic_add(dbeta_+2*C+i, dbeta2)
+    tl.atomic_add(dbeta_+3*C+i, dbeta3)
 
-def bw2_triton(dy, x, b, db, L, R, alpha, beta):
+    tl.atomic_add(dalpha_+i, dalpha)
+
+def bw3_triton(dy, x, b, da, R, alpha, beta):
     B,T,C = x.shape
-    D = 32
-    dC = min(C,32)
+    D = R.shape[2]
+    dC = min(C,64)
+    dT = min(T,64)
+    dT2 = min(T,1024)
+    assert T%dT2 == 0 and dT2%dT == 0
+    assert C%dC == 0
+    assert list(R.shape) == [4,C,D]
+    assert list(b.shape) == [B,T,4*D]
+    dx = th.empty((B,T,C), dtype=th.bfloat16, device=x.device)
+    dx0 = th.empty((B,T//dT,C), dtype=th.bfloat16, device=x.device)
+    dR = th.zeros((4,C,D), dtype=th.float32, device=x.device)
+    dalpha = th.zeros((C,), dtype=th.float32, device=x.device)
+    dbeta = th.zeros((4,1,1,C), dtype=th.float32, device=x.device)
+    bw3_triton_[(B*(T//dT2)*(C//dC),)](*dy,x,b,da,R,alpha,beta, dx,dR,dalpha,dbeta, dx0, B,T,C,D,dT,dC,dT2, num_stages=2)
+    dx[:,dT-1:T-1:dT,:] += dx0[:,1:,:]
+    return tuple(i.bfloat16() for i in [dx, dR, dalpha, dbeta])
+
+
+@triton.jit
+def bw4_triton_(x_, db_, alpha_, dL_, T:tl.constexpr,C:tl.constexpr,D:tl.constexpr,dT:tl.constexpr,dC:tl.constexpr,dT2:tl.constexpr):
+    bi = tl.program_id(0)//((T//dT2)*(C//dC))
+    t0 = tl.program_id(0)//(C//dC)%(T//dT2) * dT2
+    i0 = tl.program_id(0)%(C//dC) * dC
+
+    dt = tl.arange(0,dT)[:,None]
+    i = i0+tl.arange(0,dC)[None,:]
+    j = tl.arange(0,D)[None,:]
+
+    dL = tl.zeros((D,dC), tl.float32)
+
+    for t1 in range(t0,t0+dT2,dT):
+        t = t1+dt
+
+        db = tl.load(db_+IND3(bi,t,j, T,D))
+        x = tl.load(x_+IND3(bi,t,i, T,C))
+        diff = tl.load(x_+IND3(bi,t-1,i, T,C), mask=(t>0)) - x
+        alpha = tl.load(alpha_+i)
+        a = x + diff * alpha
+
+        dL = tl.dot(db.trans(), a, dL)
+
+    tl.atomic_add(dL_+IND2(j.trans(),i, C), dL)
+
+def bw4_triton(x, db, alpha):
+    B,T,C = x.shape
+    D = db.shape[2]
+    dC = min(C,64)
     dT = min(T,32)
     dT2 = min(T,1024)
     assert T%dT2 == 0 and dT2%dT == 0
     assert C%dC == 0
-    assert list(L.shape) == [4*D,C]
-    assert list(R.shape) == [4,C,D]
-    assert list(b.shape) == [B,T,4*D]
-    assert list(db.shape) == [B,T,4*D]
-    dx = th.empty((B,T,C), dtype=th.bfloat16, device=x.device)
-    dx0 = th.empty((B,T//dT,C), dtype=th.bfloat16, device=x.device)
-    dL = th.zeros((4*D,C), dtype=th.float32, device=x.device)
-    dR = th.zeros((4,C,D), dtype=th.float32, device=x.device)
-    dalpha = th.zeros((1,1,C), dtype=th.float32, device=x.device)
-    dbeta = th.zeros((4,1,1,C), dtype=th.float32, device=x.device)
-    bw2_triton_[(B*(T//dT2)*(C//dC),)](*dy,x,b,db,L,R,alpha,beta, dx,dL,dR,dalpha,dbeta, dx0, B,T,C,D,dT,dC,dT2, num_stages=1)
-    dx[:,dT-1:T-1:dT,:] += dx0[:,1:,:]
-    return dx, dL, dR, dalpha, dbeta
+    dL = th.zeros((D,C), dtype=th.float32, device=x.device)
+    bw4_triton_[(B*(T//dT2)*(C//dC),)](x, db, alpha, dL, T,C,D,dT,dC,dT2, num_stages=2)
+    return dL
 
-class TimeShift(th.autograd.Function):
+
+class DDLerp(th.autograd.Function):
     @staticmethod
     def forward(ctx, x, alpha, L, R, beta):
         assert x.dtype == th.bfloat16
@@ -234,26 +307,10 @@ class TimeShift(th.autograd.Function):
         x, alpha, L, R, beta, b = ctx.saved_tensors
         B,T,C = x.shape
         dy = (dy0,dy1,dy2,dy3)
-        db = bw1_triton(dy, x, R)
-        dx, dL, dR, dalpha, dbeta = bw2_triton(dy, x, b, db, L, R, alpha, beta)
+        db = bw1_triton(dy, x, R, b)
+        da = bw2_triton(db, L)
+        dx, dR, dalpha, dbeta = bw3_triton(dy, x, b, da, R, alpha, beta)
+        dL = bw4_triton(x, db, alpha)
         return dx, dalpha, dL, dR, dbeta
 
-fused_time_shift = TimeShift.apply
-
-if __name__ == '__main__':
-    from test_utils import *
-    th.manual_seed(0)
-
-    B = 4 * 12
-    T = 1024
-    C = 768
-
-    x,mix,W1,W2,bias = th.randn(B,T,C), th.randn(C), th.randn(32*4,C), th.randn(4,C,32), th.randn(4,1,1,C)
-    x,mix,W1,W2,bias = [i.cuda()/2 for i in [x,mix,W1,W2,bias]]
-    x = x.bfloat16()
-
-    f = wrap#TimeShift.apply
-    grad_check(f, reference, (x,mix,W1,W2,bias), backward=True)
-
-    f = th.compile(f, fullgraph=True)
-    benchmark(f, (x,mix,W1,W2,bias), backward=True)
+ddlerp = DDLerp.apply

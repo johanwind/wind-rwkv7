@@ -29,7 +29,7 @@ def load_attn_kernel(HEAD_SIZE):
     if hasattr(torch.ops.wind, 'forward'): return
     CUDA_FLAGS = ["-res-usage", "--use_fast_math", "-O3", "-Xptxas -O3", "--extra-device-vectorization"]
     path = os.path.dirname(__file__)
-    load(name="wind", sources=[os.path.join(path,'rwkv7.cu'), os.path.join(path,'rwkv7.cpp')], is_python_module=False, verbose=True, extra_cuda_cflags=CUDA_FLAGS+[f'-D_C_={HEAD_SIZE}'])
+    load(name="wind", sources=[os.path.join(path,'fused_attn_ln.cu'), os.path.join(path,'fused_attn_ln.cpp')], is_python_module=False, verbose=True, extra_cuda_cflags=CUDA_FLAGS+[f'-D_C_={HEAD_SIZE}'])
     assert hasattr(torch.ops.wind, 'forward')
 
 def fused_attn_ln(r,w,k,v,a,b,g, params, HEAD_SIZE):
