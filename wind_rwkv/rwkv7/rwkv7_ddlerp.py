@@ -306,17 +306,24 @@ def bw4_triton(x, db, alpha):
 class DDLerp(th.autograd.Function):
     @staticmethod
     def forward(ctx, x, alpha, L, R, beta):
-        assert x.dtype == th.bfloat16
-        L = L.bfloat16()
-        R = R.bfloat16()
-        alpha = alpha.bfloat16()
-        beta = beta.bfloat16()
+        L,R,alpha,beta = [i.bfloat16() for i in [L,R,alpha,beta]]
+        if not th.compiler.is_compiling():
+            assert all(i.is_contiguous() for i in [x,alpha,L,R,beta])
+            assert x.dtype == th.bfloat16
+            B,T,C = x.shape
+            D = R.shape[2]
+            assert list(alpha.shape) == [C]
+            assert list(beta.shape) == [4,1,1,C]
+            assert list(L.shape) == [4*D,C]
+            assert list(R.shape) == [4,C,D]
         b = fw1_triton(x, alpha, L)
         y = fw2_triton(b, R, beta, x)
         ctx.save_for_backward(x, alpha, L, R, beta, b)
         return y.unbind(dim=0)
     @staticmethod
     def backward(ctx, dy0, dy1, dy2, dy3):
+        if not th.compiler.is_compiling():
+            assert all(i.is_contiguous() for i in [dy0,dy1,dy2,dy3])
         x, alpha, L, R, beta, b = ctx.saved_tensors
         B,T,C = x.shape
         dy = (dy0,dy1,dy2,dy3)

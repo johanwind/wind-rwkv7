@@ -34,7 +34,7 @@ if __name__ == '__main__':
     D = 32
 
     f = ddlerp
-    #f = th.compile(f, fullgraph=True)
+    f = th.compile(f, fullgraph=True)
 
     inputs = get_ddlerp_data(B,T,C,D)
     grad_check(f, ref_ddlerp, inputs, backward=True)

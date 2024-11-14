@@ -192,10 +192,12 @@ def bw_triton(w_in,k_in,z_in,a_in,ma_in,mk_in,Wz,Wa,Wma,Wmk,w_bias,a_bias,ma_bia
     D = Wz.shape[-1]
     dT = min(T,16)
     assert T%dT == 0
+    assert C%HEAD_SIZE == 0
     dw_in,dk_in = [th.empty_like(i) for i in [w_in,k_in]]
-    dz_in,da_in,dma_in,dmk_in = th.empty(4,B,T,C//HEAD_SIZE,D, dtype=th.bfloat16, device=w_in.device)
-    dWz,dWa,dWma,dWmk = th.zeros(4,C,D, device=w_in.device)
-    dw_bias,da_bias,dma_bias,dmk_bias = th.zeros(4,C, device=w_in.device)
+    dz_in,da_in,dma_in,dmk_in = [th.empty(B,T,C//HEAD_SIZE,D, dtype=th.bfloat16, device=w_in.device) for i in range(4)]
+    dWz,dWa,dWma,dWmk = [th.zeros(C,D, device=w_in.device) for i in range(4)]
+    dw_bias,da_bias,dma_bias,dmk_bias = [th.zeros(C, device=w_in.device) for i in range(4)]
+    #dw_bias,da_bias,dma_bias,dmk_bias = th.zeros(4, C, device=w_in.device) # Somehow sometimes causes "RuntimeError: CUDA error: an illegal memory access was encountered" when used with torch.compile
     bw_triton_[(C//HEAD_SIZE,B)](w_in,k_in,z_in,a_in,ma_in,mk_in,Wz,Wa,Wma,Wmk,w_bias,a_bias,ma_bias,mk_bias,
                                  dw_in,dk_in,dz_in,da_in,dma_in,dmk_in,dWz,dWa,dWma,dWmk,dw_bias,da_bias,dma_bias,dmk_bias,
                                  dw_out,dk_out,dz_out,db_out,
@@ -210,11 +212,17 @@ def bw_triton(w_in,k_in,z_in,a_in,ma_in,mk_in,Wz,Wa,Wma,Wmk,w_bias,a_bias,ma_bia
 class ExpandLoras(th.autograd.Function):
     @staticmethod
     def forward(ctx, w_in,k_in,z_in,a_in,ma_in,mk_in,  Wz,Wa,Wma,Wmk,w_bias,a_bias,ma_bias,mk_bias, HEAD_SIZE):
-        #print([i.is_contiguous() for i in [z_in,a_in,ma_in,mk_in]])
-        z_in,a_in,ma_in,mk_in = [i.contiguous() for i in [z_in,a_in,ma_in,mk_in]] #TODO
+        z_in,a_in,ma_in,mk_in = [i.contiguous() for i in [z_in,a_in,ma_in,mk_in]]
+        Wz, Wa, Wma, Wmk, w_bias, a_bias, ma_bias, mk_bias = [i.bfloat16() for i in [Wz, Wa, Wma, Wmk, w_bias, a_bias, ma_bias, mk_bias]]
         if not th.compiler.is_compiling():
             assert all(i.is_contiguous() for i in [w_in, k_in, z_in, a_in, ma_in, mk_in, Wz, Wa, Wma, Wmk, w_bias, a_bias, ma_bias, mk_bias])
-        Wz, Wa, Wma, Wmk, w_bias, a_bias, ma_bias, mk_bias = [i.bfloat16() for i in [Wz, Wa, Wma, Wmk, w_bias, a_bias, ma_bias, mk_bias]]
+            assert all(i.dtype==th.bfloat16 for i in [w_in, k_in, z_in, a_in, ma_in, mk_in, Wz, Wa, Wma, Wmk, w_bias, a_bias, ma_bias, mk_bias])
+            B,T,C = w_in.shape
+            D = z_in.shape[2]
+            assert all(list(i.shape) == [B,T,C] for i in [w_in, k_in])
+            assert all(list(i.shape) == [B,T,D] for i in [z_in, a_in, ma_in, mk_in])
+            assert all(list(i.shape) == [C,D] for i in [Wz, Wa, Wma, Wmk])
+            assert all(list(i.shape) == [C] for i in [w_bias, a_bias, ma_bias, mk_bias])
         w_out, k_out, z_out, b_out = fw_triton(w_in, k_in, z_in, a_in, ma_in, mk_in, Wz, Wa, Wma, Wmk, w_bias, a_bias, ma_bias, mk_bias, HEAD_SIZE)
         ctx.save_for_backward(w_in, k_in, z_in, a_in, ma_in, mk_in, Wz, Wa, Wma, Wmk, w_bias, a_bias, ma_bias, mk_bias)
         ctx.headsz = HEAD_SIZE
@@ -224,6 +232,7 @@ class ExpandLoras(th.autograd.Function):
         w_in, k_in, z_in, a_in, ma_in, mk_in, Wz, Wa, Wma, Wmk, w_bias, a_bias, ma_bias, mk_bias = ctx.saved_tensors
         if not th.compiler.is_compiling():
             assert all(i.is_contiguous() for i in [dw_out, dk_out, dz_out, db_out])
+            assert all(i.dtype==th.bfloat16 for i in [dw_out, dk_out, dz_out, db_out])
         dw_in,dk_in,dz_in,da_in,dma_in,dmk_in,dWz,dWa,dWma,dWmk,dw_bias,da_bias,dma_bias,dmk_bias = bw_triton(w_in,k_in,z_in,a_in,ma_in,mk_in,Wz,Wa,Wma,Wmk,w_bias,a_bias,ma_bias,mk_bias, dw_out,dk_out,dz_out,db_out, ctx.headsz)
         return dw_in,dk_in,dz_in,da_in,dma_in,dmk_in,dWz,dWa,dWma,dWmk,dw_bias,da_bias,dma_bias,dmk_bias, None
 
