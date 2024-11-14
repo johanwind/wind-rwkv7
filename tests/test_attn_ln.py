@@ -1,6 +1,6 @@
 import torch as th
 F = th.nn.functional
-from wind_rwkv.rwkv7 import fused_attn_ln, load_attn_kernel
+from wind_rwkv.rwkv7 import attn_ln, load_attn_ln
 from utils import *
 
 def ref_attn_ln(q,w,k,v,a,b,g, params, HEAD_SIZE):
@@ -35,13 +35,15 @@ if __name__ == '__main__':
     C = 64
     H = 768 // C
 
-    load_attn_kernel(C)
+    load_attn_ln(C)
 
-    f = fused_attn_ln
-    f = th.compile(f, fullgraph=True)
+    f = attn_ln
+    f = th.compile(f, mode='reduce-overhead', fullgraph=True) # reduce-overhead makes a ~40% difference!
 
     inputs = get_attn_ln_data(B1,T,H,C)
     grad_check(f, ref_attn_ln, inputs, backward=True, aux=(C,))
 
     inputs = get_attn_ln_data(B2,T,H,C)
+    #timer = FuncTimer(th.ops.wind, ['forward', 'backward'])
     benchmark(f, inputs, backward=True, aux=(C,))
+    #timer.print_summary()

@@ -18,6 +18,22 @@ def ref_expand_loras(w_in, k_in, z_in, a_in, ma_in, mk_in, Wz, Wa, Wma, Wmk, w_b
     b_out = -z_out*a
     return tuple(i.bfloat16() for i in [w_out, k_out, z_out, b_out])
 
+def baseline(w_in, k_in, z_in, a_in, ma_in, mk_in, Wz, Wa, Wma, Wmk, w_bias, a_bias, ma_bias, mk_bias, HEAD_SIZE):
+    with th.amp.autocast(device_type='cuda', dtype=th.bfloat16):
+        w_out = -F.softplus(-(w_bias + w_in)) - 0.5
+
+        z = k_in + th.tanh(z_in) @ Wz.mT
+        z_out = F.normalize(z.view(B,T,-1,HEAD_SIZE), dim=-1, p=2.0).view(B,T,C)
+        a = th.sigmoid( a_bias + a_in @ Wa.mT )
+
+        ma = th.sigmoid(ma_bias + ma_in @ Wma.mT)
+        k = k_in * ma + k_in*a * (1 - ma)
+        mk = th.sigmoid(mk_bias + mk_in @ Wmk.mT)
+        k_out = k * (w_out*mk).exp()
+        b_out = -z_out*a
+        return tuple(i.bfloat16() for i in [w_out, k_out, z_out, b_out])
+
+
 def get_expand_loras_data(B,T,C,D):
     w_in, k_in = th.randn(2,B,T,C)
     (z_in, a_in, ma_in, mk_in) = th.randn(4,B,T,D)
@@ -41,4 +57,6 @@ if __name__ == '__main__':
 
     inputs = get_expand_loras_data(B,T,C,D)
     grad_check(f, ref_expand_loras, inputs, backward=True, aux=(HEAD_SIZE,))
+    #timer = FuncTimer('wind_rwkv.rwkv7.rwkv7_expand_loras', ['fw_triton', 'bw_triton'])
     benchmark(f, inputs, backward=True, aux=(HEAD_SIZE,))
+    #timer.print_summary()

@@ -83,35 +83,48 @@ def fw2_triton(b, R, beta, x):
     fw2_triton_[(B*(T//dT)*(C//dC),)](x, beta, R, b, y, B,T,C,D,dT,dC, num_stages=1)
     return y
 
+@triton.jit
+def bw1_store(b_,db_, db, bi,t,k,j,T,D):
+    b = tl.load(b_+IND4(bi,t,k,j, T,4,D)).to(tl.float32)
+    db = db-b*b*db
+    tl.store(db_+IND4(bi,t,k,j, T,4,D), db.to(tl.bfloat16))
 
 @triton.jit
 def bw1_triton_(dy0_,dy1_,dy2_,dy3_, x_, R_, db_, b_,  B:tl.constexpr,T:tl.constexpr,C:tl.constexpr,D:tl.constexpr,dT:tl.constexpr,dC:tl.constexpr):
     bi = tl.program_id(0)//(T//dT)
     t0 = tl.program_id(0)%(T//dT) * dT
 
-    t = t0 + tl.arange(0,dT)[None,:,None]
-    i = tl.arange(0,dC)[None,None,:]
-    iT = tl.arange(0,dC)[None,:,None]
-    j = tl.arange(0,D)[None,None,:]
-    k = tl.arange(0,4)[:,None,None]
+    t = t0 + tl.arange(0,dT)[:,None]
+    i = tl.arange(0,dC)[None,:]
+    iT = tl.arange(0,dC)[:,None]
+    j = tl.arange(0,D)[None,:]
 
-    db = tl.zeros((4,dT,D), tl.float32)
+    db0 = tl.zeros((dT,D), tl.float32)
+    db1 = tl.zeros((dT,D), tl.float32)
+    db2 = tl.zeros((dT,D), tl.float32)
+    db3 = tl.zeros((dT,D), tl.float32)
     for i0 in range(0,C,dC):
         x = tl.load(x_+IND3(bi,t,i0+i, T,C), eviction_policy='evict_first')
         diff = tl.load(x_+IND3(bi,t-1,i0+i, T,C), mask=(t>0), eviction_policy='evict_first') - x
 
-        dy = tl.zeros((4,dT,dC), tl.bfloat16)
-        dy += tl.load(dy0_+IND3(bi,t,i0+i, T,C)+k*0, mask=k==0, eviction_policy='evict_first')
-        dy += tl.load(dy1_+IND3(bi,t,i0+i, T,C)+k*0, mask=k==1, eviction_policy='evict_first')
-        dy += tl.load(dy2_+IND3(bi,t,i0+i, T,C)+k*0, mask=k==2, eviction_policy='evict_first')
-        dy += tl.load(dy3_+IND3(bi,t,i0+i, T,C)+k*0, mask=k==3, eviction_policy='evict_first')
-        dc = dy * diff
+        dy0 = tl.load(dy0_+IND3(bi,t,i0+i, T,C), eviction_policy='evict_first')
+        dy1 = tl.load(dy1_+IND3(bi,t,i0+i, T,C), eviction_policy='evict_first')
+        dy2 = tl.load(dy2_+IND3(bi,t,i0+i, T,C), eviction_policy='evict_first')
+        dy3 = tl.load(dy3_+IND3(bi,t,i0+i, T,C), eviction_policy='evict_first')
+        R0 = tl.load(R_+IND3(0,i0+iT,j, C,D), eviction_policy='evict_last')
+        R1 = tl.load(R_+IND3(1,i0+iT,j, C,D), eviction_policy='evict_last')
+        R2 = tl.load(R_+IND3(2,i0+iT,j, C,D), eviction_policy='evict_last')
+        R3 = tl.load(R_+IND3(3,i0+iT,j, C,D), eviction_policy='evict_last')
 
-        R = tl.load(R_+IND3(k,i0+iT,j, C,D), eviction_policy='evict_last')
-        db = tl.dot(dc, R, db)
-    b = tl.load(b_+IND4(bi,t,k,j, T,4,D)).to(tl.float32)
-    db = db-b*b*db
-    tl.store(db_+IND4(bi,t,k,j, T,4,D), db.to(tl.bfloat16))
+        db0 = tl.dot(dy0*diff, R0, db0)
+        db1 = tl.dot(dy1*diff, R1, db1)
+        db2 = tl.dot(dy2*diff, R2, db2)
+        db3 = tl.dot(dy3*diff, R3, db3)
+
+    bw1_store(b_,db_, db0, bi,t,0,j,T,D)
+    bw1_store(b_,db_, db1, bi,t,1,j,T,D)
+    bw1_store(b_,db_, db2, bi,t,2,j,T,D)
+    bw1_store(b_,db_, db3, bi,t,3,j,T,D)
 
 def bw1_triton(dy, x, R, b):
     B,T,C = x.shape

@@ -1,6 +1,11 @@
 import torch as th
 import triton.testing
 
+import importlib
+from functools import wraps
+from time import time
+from collections.abc import Iterable
+
 def grad_list(params):
     r = []
     for p in params:
@@ -64,3 +69,54 @@ def benchmark(f, params, backward = True, aux=()):
     ms, min_ms, max_ms = triton.testing.do_bench(wrap, quantiles=[0.5,0.2,0.8], warmup=500,rep=1000)
     print(f'{ms:.2f} ms ({min_ms:.2f} - {max_ms:.2f})')
     return ms
+
+def flatten(x):
+    return sum(map(flatten, x), []) if type(x) in [tuple, list] else [x]
+
+class FuncTimer:
+    def __init__(self, module, func_names):
+        if type(module) == str:
+            module = importlib.import_module(module)
+        for fn in func_names:
+            setattr(module, fn, self.wrap_func(getattr(module,fn)))
+        self.data = {}
+
+    def wrap_func(self, f):
+        @wraps(f)
+        def wrap(*args, **kw):
+            th.cuda.synchronize()
+            ts = time()
+            result = f(*args, **kw)
+            th.cuda.synchronize()
+            te = time()
+            name = f.__name__
+
+            mem = 0
+            r = result if type(result) == tuple else (result,)
+            for i in flatten(args)+flatten(r):
+                if type(i) == th.Tensor:
+                    mem += i.numel()*i.element_size()
+                elif not type(i) in [float,int,bool,str,type(None)]:
+                    print('Warning: FuncTimer found non-tensor argument or output of type', type(i), 'in ', name)
+
+            if not name in self.data or mem != self.data[name][0]:
+                self.data[name] = [mem, []]
+
+            self.data[name][1].append(te-ts)
+            return result
+        return wrap
+
+    def print_summary(self):
+        its = min(len(i[1]) for i in self.data.values())
+        sum_t = 0
+        for name in self.data:
+            times = self.data[name][1]
+            assert len(times)%its == 0
+            cnt = len(times)//its
+            mem = self.data[name][0] * cnt
+            t = times[len(times)//2:]
+            t = sum(t)/len(t) * cnt
+            band = mem/2**30/max(t,1e-12)
+            print('%6.1f µs %5.1f MB (%5.1f GB/s) for function %s' % (t*1e6, mem/2**20, band, name))
+            sum_t += t
+        print('%.1f ms accounted for' % (sum_t*1e3))

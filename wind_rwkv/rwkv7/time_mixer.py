@@ -15,7 +15,7 @@ class TimeMixer(nn.Module):
         self.head_size = self.dim_att // args.n_head
         assert self.dim_att % self.n_head == 0
 
-        wind_rwkv7.load_attn_kernel(self.head_size)
+        wind_rwkv7.load_attn_ln(self.head_size)
 
         ratio_0_to_1 = layer_id / max(args.n_layer - 1, 1)  # 0 to 1
         ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
@@ -108,5 +108,5 @@ class TimeMixer(nn.Module):
 
         w, k, kk, b = wind_rwkv7.expand_loras(w2, k, kk1, a1, ma1, mk1, self.time_kkk_w2, self.time_aaa_w2, self.ma_w2, self.mk_w2, self.time_decay, self.time_aaaaa, self.time_misc_a, self.time_misc_k, C//H)
 
-        x = wind_rwkv7.fused_attn_ln(r.bfloat16(), w.bfloat16(), k.bfloat16(), v.bfloat16(), kk.bfloat16(), b.bfloat16(), g.bfloat16(), torch.stack([self.ln_x.weight, self.ln_x.bias, self.time_faaaa]), C//H)
+        x = wind_rwkv7.attn_ln(r.bfloat16(), w.bfloat16(), k.bfloat16(), v.bfloat16(), kk.bfloat16(), b.bfloat16(), g.bfloat16(), torch.stack([self.ln_x.weight, self.ln_x.bias, self.time_faaaa]), C//H)
         return x @ self.Wo.bfloat16().mT

@@ -55,7 +55,8 @@ class RefTimeMixer(TimeMixer):
         return (x*g) @ self.Wo.mT
 
 
-B = 4 # * 12
+B1 = 4
+B2 = 64
 T = 1024
 HC = 768
 HEAD_SIZE = 64
@@ -63,13 +64,14 @@ HEAD_SIZE = 64
 model = TimeMixer(namedtuple('Config',['n_layer','n_head','n_embd'])(12,HC//HEAD_SIZE,HC), 6).cuda()
 ref_model = RefTimeMixer(namedtuple('Config',['n_layer','n_head','n_embd'])(12,HC//HEAD_SIZE,HC), 6).cuda()
 
-#model = th.compile(model, fullgraph=True)
+#model = th.compile(model, mode='reduce-overhead', fullgraph=True)
 
 params = dict(model.named_parameters())
 
 keys = params.keys()
 ref_keys = dict(ref_model.named_parameters()).keys()
-x = th.randn(B, T, HC).cuda()
+
+x = th.randn(B1, T, HC).cuda()
 inputs = [i.detach().normal_(std=0.1) for i in params.values()] + [x]
 
 def f(*inputs):
@@ -79,4 +81,13 @@ def ref(*inputs):
 
 grad_check(f, ref, inputs, backward=True)
 
+x = th.randn(B2, T, HC).cuda()
+inputs = [i.detach().normal_(std=0.1) for i in params.values()] + [x]
+
+#timer1 = FuncTimer('wind_rwkv.rwkv7.rwkv7_ddlerp', [f'fw{i}_triton' for i in [1,2]] + [f'bw{i}_triton' for i in [1,2,3,4]])
+#timer2 = FuncTimer('wind_rwkv.rwkv7.rwkv7_expand_loras', ['fw_triton', 'bw_triton'])
+#timer3 = FuncTimer(th.ops.wind, ['forward', 'backward'])
 benchmark(f, inputs, backward=True)
+#timer1.print_summary()
+#timer2.print_summary()
+#timer3.print_summary()
