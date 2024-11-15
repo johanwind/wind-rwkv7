@@ -49,7 +49,7 @@ class RefTimeMixer(TimeMixer):
         k = k * th.clamp(w*mk, max=0).exp()
 
         x = self.ref_attn(r, w, k, v, -kk, kk*a, C//H)
-        x = F.group_norm(x.view(B*T, HC), H, self.ln_x.weight, self.ln_x.bias, eps = 64e-5).view(B,T,C)
+        x = F.group_norm(x.view(B*T, C), H, self.ln_x.weight, self.ln_x.bias, eps = 64e-5).view(B,T,C)
 
         x = x + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.time_faaaa.view(H,-1)).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
         return (x*g) @ self.Wo.mT
@@ -61,10 +61,10 @@ T = 1024
 HC = 768
 HEAD_SIZE = 64
 
-model = TimeMixer(namedtuple('Config',['n_layer','n_head','n_embd'])(12,HC//HEAD_SIZE,HC), 6).cuda()
+model = TimeMixer(namedtuple('Config',['n_layer','n_head','n_embd'])(12,HC//HEAD_SIZE,HC), 6, use_triton_ddlerp = True, use_triton_loras = True, attn_impl = 'cuda').cuda()
 ref_model = RefTimeMixer(namedtuple('Config',['n_layer','n_head','n_embd'])(12,HC//HEAD_SIZE,HC), 6).cuda()
 
-#model = th.compile(model, mode='reduce-overhead', fullgraph=True)
+#model = th.compile(model, fullgraph=True)#, mode='reduce-overhead'
 
 params = dict(model.named_parameters())
 
@@ -84,10 +84,21 @@ grad_check(f, ref, inputs, backward=True)
 x = th.randn(B2, T, HC).cuda()
 inputs = [i.detach().normal_(std=0.1) for i in params.values()] + [x]
 
-#timer1 = FuncTimer('wind_rwkv.rwkv7.rwkv7_ddlerp', [f'fw{i}_triton' for i in [1,2]] + [f'bw{i}_triton' for i in [1,2,3,4]])
-#timer2 = FuncTimer('wind_rwkv.rwkv7.rwkv7_expand_loras', ['fw_triton', 'bw_triton'])
+timer1 = FuncTimer('wind_rwkv.rwkv7.rwkv7_ddlerp', [f'fw{i}_triton' for i in [1,2]] + [f'bw{i}_triton' for i in [1,2,3,4]])
+timer2 = FuncTimer('wind_rwkv.rwkv7.rwkv7_expand_loras', ['fw_triton', 'bw_triton'])
+timer3 = FuncTimer('wind_rwkv.rwkv7.rwkv7_attn_ln', ['fw_attn_ln', 'bw_attn_ln'])
 #timer3 = FuncTimer(th.ops.wind, ['forward', 'backward'])
 benchmark(f, inputs, backward=True)
-#timer1.print_summary()
-#timer2.print_summary()
-#timer3.print_summary()
+timer1.print_summary()
+timer2.print_summary()
+timer3.print_summary()
+
+
+# Breakdown
+# Total: 85 ms
+# ddlerp: 12 ms
+# main matmuls: 29 ms
+# expand loras: 7 ms
+# attn + post ln: 19 ms
+# output matmul: 8 ms
+# unaccounted (overhead?): 10 ms

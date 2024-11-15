@@ -2,6 +2,20 @@ import os
 import torch as th
 from torch.utils.cpp_extension import load
 
+def fw_attn_ln(w,q,k,v,a,b,g,params,s0):
+    B,T,H,C = w.shape
+    y = th.empty_like(v)
+    sT = th.empty_like(s0)
+    s = th.empty(B,H,T//16,C,C, dtype=th.bfloat16,device=w.device)
+    th.ops.wind.forward(w,q,k,v,a,b,g,params, s0,y,s,sT)
+    return y,sT,s
+
+def bw_attn_ln(w,q,k,v,a,b,g,params,s, dy,dsT):
+    dw,dq,dk,dv,da,db,dg,ds0 = [th.empty_like(x) for x in [w,q,k,v,a,b,g,dsT]]
+    dparams = th.zeros_like(params)
+    th.ops.wind.backward(w,q,k,v,a,b,g,params, dy,s,dsT, dw,dq,dk,dv,da,db,dg,dparams,ds0)
+    return dw,dq,dk,dv,da,db,dg,dparams,ds0
+
 class WindRWKV7(th.autograd.Function):
     @staticmethod
     def forward(ctx, w,q,k,v,a,b,g,params,s0):
@@ -14,10 +28,7 @@ class WindRWKV7(th.autograd.Function):
             assert all(i.shape == w.shape for i in [w,q,k,v,a,b,g])
             assert list(params.shape) == [3,H*C]
             assert list(s0.shape) == [B,H,C,C]
-        y = th.empty_like(v)
-        sT = th.empty_like(s0)
-        s = th.empty(B,H,T//16,C,C, dtype=th.bfloat16,device=w.device)
-        th.ops.wind.forward(w,q,k,v,a,b,g,params, s0,y,s,sT)
+        y,sT,s = fw_attn_ln(w,q,k,v,a,b,g,params,s0)
         ctx.save_for_backward(w,q,k,v,a,b,g,params,s)
         return y, sT
     @staticmethod
@@ -26,9 +37,7 @@ class WindRWKV7(th.autograd.Function):
             assert all(i.dtype==th.bfloat16 for i in [dy,dsT])
             assert all(i.is_contiguous() for i in [dy,dsT])
         w,q,k,v,a,b,g,params,s = ctx.saved_tensors
-        dw,dq,dk,dv,da,db,dg,dparams,ds0 = [th.empty_like(x) for x in [w,q,k,v,a,b,g,params,dsT]]
-        dparams.zero_()
-        th.ops.wind.backward(w,q,k,v,a,b,g,params, dy,s,dsT, dw,dq,dk,dv,da,db,dg,dparams,ds0)
+        dw,dq,dk,dv,da,db,dg,dparams,ds0 = bw_attn_ln(w,q,k,v,a,b,g,params,s, dy,dsT)
         return dw,dq,dk,dv,da,db,dg,dparams,ds0
 
 def load_attn_ln(HEAD_SIZE):

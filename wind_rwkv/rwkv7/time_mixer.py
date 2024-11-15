@@ -3,8 +3,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wind_rwkv.rwkv7 as wind_rwkv7
 
+def ref_attn(q,w,k,v,a,b, HEAD_SIZE):
+    B,T,HC = q.shape
+    H, C = HC//HEAD_SIZE, HEAD_SIZE
+    q,w,k,v,a,b = [i.view(B,T,H,C) for i in [q,w,k,v,a,b]]
+    s = torch.zeros(B,H,C,C, device=q.device)
+    w = torch.exp(-torch.exp(w))
+    y = torch.empty_like(v)
+    for t in range(T):
+        s = s * w[:,t,:,None,:] + s @ a[:,t,:,:,None] * b[:,t,:,None,:] + v[:,t,:,:,None] * k[:,t,:,None,:]
+        y[:,t,:,:,None] = s @ q[:,t,:,:,None]
+    return y.view(B,T,HC)
+
 class TimeMixer(nn.Module):
-    def __init__(self, args, layer_id):
+    def __init__(self, args, layer_id, use_triton_ddlerp = True, use_triton_loras = True, attn_impl = 'cuda', triton_dot_prec = 'fp32'):
         super().__init__()
         self.args = args
         self.layer_id = layer_id
@@ -16,6 +28,10 @@ class TimeMixer(nn.Module):
         assert self.dim_att % self.n_head == 0
 
         wind_rwkv7.load_attn_ln(self.head_size)
+        self.use_triton_ddlerp = use_triton_ddlerp
+        self.use_triton_loras = use_triton_loras
+        self.attn_impl = attn_impl
+        self.triton_dot_prec = triton_dot_prec
 
         ratio_0_to_1 = layer_id / max(args.n_layer - 1, 1)  # 0 to 1
         ratio_1_to_almost0 = 1.0 - (layer_id / args.n_layer)  # 1 to ~0
@@ -91,7 +107,15 @@ class TimeMixer(nn.Module):
         B, T, C = x.shape
         H = self.n_head
 
-        xrg,xwa,xk,xv = wind_rwkv7.ddlerp(x.bfloat16(), self.time_maa_x, self.time_maa_w1, self.time_maa_w2, self.time_maa)
+        if self.use_triton_ddlerp:
+            xrg,xwa,xk,xv = wind_rwkv7.ddlerp(x.bfloat16(), self.time_maa_x, self.time_maa_w1, self.time_maa_w2, self.time_maa)
+        else:
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                xx = torch.nn.functional.pad(x, (0,0,1,-1)) - x
+                xxx = x + xx * self.time_maa_x
+                xxx = torch.tanh(xxx @ self.time_maa_w1.mT).view(B*T, 4, -1).transpose(0, 1)
+                xxx = (xxx @ self.time_maa_w2.mT).view(4, B, T, C)
+                xrg,xwa,xk,xv = (x + xx * (xxx+self.time_maa)).bfloat16().unbind(dim=0)
 
         r = xrg @ self.Wr.bfloat16().mT
         g1 = xrg @ self.gate_w1.bfloat16().mT
@@ -106,7 +130,38 @@ class TimeMixer(nn.Module):
         g = torch.tanh(g1) @ self.gate_w2.bfloat16().mT
         w2 = torch.tanh(w1) @ self.time_decay_w2.bfloat16().mT
 
-        w, k, kk, b = wind_rwkv7.expand_loras(w2, k, kk1, a1, ma1, mk1, self.time_kkk_w2, self.time_aaa_w2, self.ma_w2, self.mk_w2, self.time_decay, self.time_aaaaa, self.time_misc_a, self.time_misc_k, C//H)
+        if self.use_triton_loras:
+            w, k, kk, b = wind_rwkv7.expand_loras(w2, k, kk1, a1, ma1, mk1, self.time_kkk_w2, self.time_aaa_w2, self.ma_w2, self.mk_w2, self.time_decay, self.time_aaaaa, self.time_misc_a, self.time_misc_k, C//H)
+        else:
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                w = -F.softplus(-(self.time_decay + w2)) - 0.5
 
-        x = wind_rwkv7.attn_ln(r.bfloat16(), w.bfloat16(), k.bfloat16(), v.bfloat16(), kk.bfloat16(), b.bfloat16(), g.bfloat16(), torch.stack([self.ln_x.weight, self.ln_x.bias, self.time_faaaa]), C//H)
+                kk = k + torch.tanh(kk1) @ self.time_kkk_w2.mT
+                kk = F.normalize(kk.view(B,T,H,-1), dim=-1, p=2.0).view(B,T,C)
+                a = torch.sigmoid(self.time_aaaaa + a1 @ self.time_aaa_w2.mT )
+
+                ma = torch.sigmoid(self.time_misc_a + ma1 @ self.ma_w2.mT)
+                k = k * ma + k*a * (1 - ma)
+                mk = torch.sigmoid(self.time_misc_k + mk1 @ self.mk_w2.mT)
+                k = k * (w*mk).exp()
+                b = -kk*a
+
+        if self.attn_impl == 'cuda':
+            x = wind_rwkv7.attn_ln(r.bfloat16(), w.bfloat16(), k.bfloat16(), v.bfloat16(), kk.bfloat16(), b.bfloat16(), g.bfloat16(), torch.stack([self.ln_x.weight, self.ln_x.bias, self.time_faaaa]), C//H)
+        elif self.attn_impl == 'ref':
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                x = ref_attn(r, w, k, v, kk, b, C//H)
+                x = F.group_norm(x.view(B*T, C), H, self.ln_x.weight, self.ln_x.bias, eps = 64e-5).view(B,T,C)
+
+                x = x + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.time_faaaa.view(H,-1)).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
+                x = (x*g).bfloat16()
+        elif self.attn_impl == 'triton':
+            x = wind_rwkv7.attn_triton(r, w, k, v, kk, b, C//H, dot_prec = self.triton_dot_prec)
+            x = F.group_norm(x.float().view(B*T, C), H, self.ln_x.weight, self.ln_x.bias, eps = 64e-5).view(B,T,C)
+
+            x = x + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*self.time_faaaa.view(H,-1)).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
+            x = (x*g).bfloat16()
+        else:
+            assert self.attn_impl in ['cuda','ref','triton']
+
         return x @ self.Wo.bfloat16().mT

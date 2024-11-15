@@ -1,6 +1,6 @@
 import torch as th
 F = th.nn.functional
-from wind_rwkv.rwkv7 import attn_ln, load_attn_ln
+from wind_rwkv.rwkv7 import attn_ln, load_attn_ln, attn_triton
 from utils import *
 
 def ref_attn_ln(q,w,k,v,a,b,g, params, HEAD_SIZE):
@@ -20,6 +20,16 @@ def ref_attn_ln(q,w,k,v,a,b,g, params, HEAD_SIZE):
     y = (y * g).view(B,T,HC)
     return y.to(dtype)
 
+def triton_attn_ln(r,w,k,v,a,b,g, params, HEAD_SIZE):
+    B,T,C = r.shape
+    H = C//HEAD_SIZE
+    x = attn_triton(r, w, k, v, a, b, C//H, dot_prec='fp32')
+    x = F.group_norm(x.float().view(B*T, C), H, params[0], params[1], eps = 64e-5).view(B,T,C)
+
+    x = x + ((r.view(B,T,H,-1)*k.view(B,T,H,-1)*params[2].view(H,-1)).sum(dim=-1, keepdim=True) * v.view(B,T,H,-1)).view(B,T,C)
+    x = (x*g).bfloat16()
+    return x
+
 def get_attn_ln_data(B,T,H,C):
     q,w,k,v,a,b,g = th.randn(7,B,T,H,C)
     w = -F.softplus(w)-0.5
@@ -36,9 +46,10 @@ if __name__ == '__main__':
     H = 768 // C
 
     load_attn_ln(C)
-
     f = attn_ln
-    f = th.compile(f, mode='reduce-overhead', fullgraph=True) # reduce-overhead makes a ~40% difference!
+    #f = triton_attn_ln
+
+    f = th.compile(f, fullgraph=True, mode='reduce-overhead') # reduce-overhead makes a ~40% difference!
 
     inputs = get_attn_ln_data(B1,T,H,C)
     grad_check(f, ref_attn_ln, inputs, backward=True, aux=(C,))

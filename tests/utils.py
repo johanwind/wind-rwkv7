@@ -107,7 +107,7 @@ class FuncTimer:
         return wrap
 
     def print_summary(self):
-        its = min(len(i[1]) for i in self.data.values())
+        its = min([len(i[1]) for i in self.data.values()], default=0)
         sum_t = 0
         for name in self.data:
             times = self.data[name][1]
