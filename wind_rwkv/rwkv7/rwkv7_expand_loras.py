@@ -1,3 +1,5 @@
+# Copyright (c) 2024, Johan Sokrates Wind
+
 import torch as th
 import torch.nn.functional as F
 import triton
