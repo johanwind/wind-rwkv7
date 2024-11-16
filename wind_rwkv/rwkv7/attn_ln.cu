@@ -256,7 +256,7 @@ __global__ void backward_kernel(int T, int H, F_ w_, F_ q_, F_ k_, F_ v_, F_ a_,
 
     auto push = [&](int t) {
         int off = bi*T*H*C + t*K*H*C + hi*C + warpi*16;
-        int si = t%fw_stages;
+        int si = t%bw_stages;
         sw_[si*WARPS+warpi] = GTile(w_+off, stride);
         sq_[si*WARPS+warpi] = GTile(q_+off, stride);
         sk_[si*WARPS+warpi] = GTile(k_+off, stride);
