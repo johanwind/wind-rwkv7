@@ -294,28 +294,40 @@ __device__ FTile operator*(const FTile&a, const FTile&b) {
 }
 
 template<int triangular = 0, int WARPS> // Lower triangular
-__device__ FTile sum_warp(float2*share, const FTile&f) {
+__device__ FTile sum_warp(float*share, const FTile&f) { // Requires share of size sizeof(float)*32*8*WARPS
     int tid = threadIdx.x%32, warpi = threadIdx.x/32;
-    FTile sum;
-    sum.zero_();
-    for (int i : {0,1,2,3}) {
-        if (i == 2 && triangular) continue;
-        for (int j = 0; j < WARPS; j++) {
-            if (warpi == j) share[tid] = f.data[i];
-            __syncthreads();
-           sum.data[i].x += share[tid].x;
-           sum.data[i].y += share[tid].y;
-            __syncthreads();
-        }
+    __syncthreads();
+    for (int i = 0; i < 8; i++) {
+        if (triangular && (i == 4 || i == 5)) continue;
+        share[32*(warpi*8+i)+tid] = f.fdata[i];
     }
-    return sum;
+    __syncthreads();
+#pragma unroll
+    for (int k = warpi; k < 8; k += WARPS) {
+        if (triangular && (k == 4 || k == 5)) continue;
+        float sum = 0;
+        for (int i = 1; i < WARPS; i++) {
+            sum += share[32*(i*8+k)+tid];
+        }
+        share[32*k+tid] += sum;
+    }
+    __syncthreads();
+    FTile ret;
+    for (int i = 0; i < 8; i++) {
+        if (triangular && (i == 4 || i == 5))
+            ret.fdata[i] = 0;
+        else
+            ret.fdata[i] = share[32*i+tid];
+    }
+    __syncthreads();
+    return ret;
 }
 
 __device__ RTile from_warp(const RTile&ra, int src, float4*share) {
     int tid = threadIdx.x%32, warpi = threadIdx.x/32;
-    RTile ret;
     if (warpi == src) share[tid] = *((float4*)ra.data);
     __syncthreads();
+    RTile ret;
     *((float4*)ret.data) = share[tid];
     __syncthreads();
     return ret;
@@ -496,7 +508,7 @@ __device__ void debug_set(RTile&ra, int i, int j, float v) {
 }
 
 template<int WARPS>
-__device__ float2 sumh(const FTile&f, float2*share) {
+__device__ float2 sumh(const FTile&f, float*share) { // Requires shared of size sizeof(float)*16*WARPS
     float2 warpsum = {f.fdata[0]+f.fdata[1]+f.fdata[4]+f.fdata[5],
         f.fdata[2]+f.fdata[3]+f.fdata[6]+f.fdata[7]};
     warpsum.x += __shfl_xor_sync(0xffffffff, warpsum.x, 1);
@@ -504,14 +516,20 @@ __device__ float2 sumh(const FTile&f, float2*share) {
     warpsum.x += __shfl_xor_sync(0xffffffff, warpsum.x, 2);
     warpsum.y += __shfl_xor_sync(0xffffffff, warpsum.y, 2);
 
-    int warpi = threadIdx.x/32, i = threadIdx.x%32/4, j = threadIdx.x%4;
-    float2 allsum = {0,0};
-    for (int wi = 0; wi < WARPS; wi++) {
-        if (warpi == wi && j == 0) share[i] = warpsum;
-        __syncthreads();
-        allsum.x += share[i].x;
-        allsum.y += share[i].y;
-        __syncthreads();
+    int tid = threadIdx.x%32, warpi = threadIdx.x/32;
+    __syncthreads();
+    if (tid%4 < 2)
+        share[warpi*16+tid/4+tid%4*8] = (tid%4?warpsum.y:warpsum.x);
+    __syncthreads();
+    if (warpi == 0 && tid < 16) {
+        float sum = 0;
+        for (int i = 1; i < WARPS; i++) {
+            sum += share[i*16+tid];
+        }
+        share[tid] += sum;
     }
-    return allsum;
+    __syncthreads();
+    float2 ret = {share[tid/4], share[tid/4+8]};
+    __syncthreads();
+    return ret;
 }
