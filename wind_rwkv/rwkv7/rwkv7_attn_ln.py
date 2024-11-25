@@ -18,7 +18,7 @@ def bw_attn_ln(w,q,k,v,a,b,g,params,s, dy,dsT):
 
 class WindRWKV7(th.autograd.Function):
     @staticmethod
-    def forward(ctx, w,q,k,v,a,b,g,params,s0):
+    def forward(w,q,k,v,a,b,g,params,s0):
         B,T,H,C = w.shape
         assert T%16 == 0
         if not th.compiler.is_compiling():
@@ -29,14 +29,20 @@ class WindRWKV7(th.autograd.Function):
             assert list(params.shape) == [3,H*C]
             assert list(s0.shape) == [B,H,C,C]
         y,sT,s = fw_attn_ln(w,q,k,v,a,b,g,params,s0)
-        ctx.save_for_backward(w,q,k,v,a,b,g,params,s)
-        return y, sT
+        return y, sT, s
     @staticmethod
-    def backward(ctx, dy, dsT):
+    def setup_context(ctx, inputs, output):
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(*inputs[:-1],output[-1])
+    @staticmethod
+    def backward(ctx, dy, dsT, ds):
+        w,q,k,v,a,b,g,params,s = ctx.saved_tensors
+        B,T,H,C = w.shape
+        if dsT is None: dsT = th.zeros(B,H,T//16,C,C, dtype=th.bfloat16,device=w.device)
         if not th.compiler.is_compiling():
+            assert ds is None
             assert all(i.dtype==th.bfloat16 for i in [dy,dsT])
             assert all(i.is_contiguous() for i in [dy,dsT])
-        w,q,k,v,a,b,g,params,s = ctx.saved_tensors
         dw,dq,dk,dv,da,db,dg,dparams,ds0 = bw_attn_ln(w,q,k,v,a,b,g,params,s, dy,dsT)
         return dw,dq,dk,dv,da,db,dg,dparams,ds0
 

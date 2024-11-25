@@ -14,7 +14,7 @@ def baseline(xrg,xwa,xk,xv, Wr,Wk,Wv,Wg1,Wkk,Wmk,Ww1,Wa,Wma,Wg2,Ww2):
 
     g = th.tanh(g1) @ Wg2.bfloat16().mT
     w2 = th.tanh(w1) @ Ww2.bfloat16().mT
-    return r, w2, k, kk1, a1, ma1, mk1, g
+    return r, w2, k, v, kk1, a1, ma1, mk1, g
 
 
 def get_data(B,T,C):
