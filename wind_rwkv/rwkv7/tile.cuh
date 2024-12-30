@@ -480,10 +480,9 @@ __device__ RTile fast_dw(const RTile&A, const RTile&q, const RTile&k) {
     for (int ci : {0,1}) {
         for (int ti : {0,1}) {
             int Ai = ti*3, di = ti*2+ci;
-            unsigned mask = 0xffff<<(j>=2)*16;
-            bf A8x  = __shfl_sync(mask, A.data[Ai].x,  8+(j>=2)*18);
-            bf A12x = __shfl_sync(mask, A.data[Ai].x, 12+(j>=2)*18);
-            bf A12y = __shfl_sync(mask, A.data[Ai].y, 12+(j>=2)*18);
+            bf A8x  = __shfl_sync(0xffffffff, A.data[Ai].x,  8+(j>=2)*18);
+            bf A12x = __shfl_sync(0xffffffff, A.data[Ai].x, 12+(j>=2)*18);
+            bf A12y = __shfl_sync(0xffffffff, A.data[Ai].y, 12+(j>=2)*18);
             bf2 nq = __shfl_xor_sync(0xffffffff, qt.data[di], 1);
             bf2 pk = __shfl_xor_sync(0xffffffff, kt.data[di], 1);
 
