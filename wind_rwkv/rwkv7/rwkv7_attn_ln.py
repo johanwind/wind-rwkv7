@@ -38,7 +38,7 @@ class WindRWKV7(th.autograd.Function):
     def backward(ctx, dy, dsT, ds):
         w,q,k,v,a,b,g,params,s = ctx.saved_tensors
         B,T,H,C = w.shape
-        if dsT is None: dsT = th.zeros(B,H,T//16,C,C, dtype=th.bfloat16,device=w.device)
+        if dsT is None: dsT = th.zeros(B,H,C,C, dtype=th.bfloat16,device=w.device)
         if not th.compiler.is_compiling():
             assert ds is None
             assert all(i.dtype==th.bfloat16 for i in [dy,dsT])
